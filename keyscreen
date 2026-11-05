@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""keyscreen - show pressed keys on screen (screenkey replacement that works on Wayland).
+
+Reads keystrokes directly from /dev/input (needs membership in the 'input' group)
+and draws them in a transparent, click-through, always-on-top overlay.
+
+Usage: keyscreen [--position bottom-right|bottom-left|bottom|top-right|top-left|top|center] [--margin 40] [--size 16] [--timeout 2.5] [--opacity 0.8]
+Stop:  Ctrl+C in the terminal, or `pkill -f keyscreen`
+"""
+import argparse
+import os
+import selectors
+import sys
+import threading
+import time
+
+os.environ.setdefault("GDK_BACKEND", "x11")  # XWayland: lets us stay on top & be positioned
+
+try:
+    import evdev
+    from evdev import ecodes as e
+except ImportError:
+    sys.exit("python3-evdev missing. Install with:  sudo apt install python3-evdev")
+
+import cairo
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo
+
+# ---------------------------------------------------------------- key names
+CHARS = {}
+for k, (lo, hi) in {
+    **{getattr(e, f"KEY_{c}"): (c.lower(), c) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+    e.KEY_1: ("1", "!"), e.KEY_2: ("2", "@"), e.KEY_3: ("3", "#"), e.KEY_4: ("4", "$"),
+    e.KEY_5: ("5", "%"), e.KEY_6: ("6", "^"), e.KEY_7: ("7", "&"), e.KEY_8: ("8", "*"),
+    e.KEY_9: ("9", "("), e.KEY_0: ("0", ")"), e.KEY_MINUS: ("-", "_"), e.KEY_EQUAL: ("=", "+"),
+    e.KEY_LEFTBRACE: ("[", "{"), e.KEY_RIGHTBRACE: ("]", "}"), e.KEY_SEMICOLON: (";", ":"),
+    e.KEY_APOSTROPHE: ("'", '"'), e.KEY_GRAVE: ("`", "~"), e.KEY_BACKSLASH: ("\\", "|"),
+    e.KEY_COMMA: (",", "<"), e.KEY_DOT: (".", ">"), e.KEY_SLASH: ("/", "?"),
+    e.KEY_KP0: ("0", "0"), e.KEY_KP1: ("1", "1"), e.KEY_KP2: ("2", "2"), e.KEY_KP3: ("3", "3"),
+    e.KEY_KP4: ("4", "4"), e.KEY_KP5: ("5", "5"), e.KEY_KP6: ("6", "6"), e.KEY_KP7: ("7", "7"),
+    e.KEY_KP8: ("8", "8"), e.KEY_KP9: ("9", "9"), e.KEY_KPDOT: (".", "."), e.KEY_KPPLUS: ("+", "+"),
+    e.KEY_KPMINUS: ("-", "-"), e.KEY_KPASTERISK: ("*", "*"), e.KEY_KPSLASH: ("/", "/"),
+}.items():
+    CHARS[k] = (lo, hi)
+
+SPECIAL = {
+    e.KEY_ENTER: "⏎", e.KEY_KPENTER: "⏎", e.KEY_BACKSPACE: "⌫", e.KEY_TAB: "⇥",
+    e.KEY_ESC: "Esc", e.KEY_SPACE: "␣", e.KEY_DELETE: "Del", e.KEY_INSERT: "Ins",
+    e.KEY_HOME: "Home", e.KEY_END: "End", e.KEY_PAGEUP: "PgUp", e.KEY_PAGEDOWN: "PgDn",
+    e.KEY_UP: "↑", e.KEY_DOWN: "↓", e.KEY_LEFT: "←", e.KEY_RIGHT: "→",
+    e.KEY_CAPSLOCK: "Caps", e.KEY_PRINT: "PrtSc", e.KEY_SYSRQ: "PrtSc",
+    e.KEY_VOLUMEUP: "🔊+", e.KEY_VOLUMEDOWN: "🔉−", e.KEY_MUTE: "🔇",
+    e.KEY_PLAYPAUSE: "⏯", e.KEY_NEXTSONG: "⏭", e.KEY_PREVIOUSSONG: "⏮",
+    e.KEY_BRIGHTNESSUP: "☀+", e.KEY_BRIGHTNESSDOWN: "☀−", e.KEY_COMPOSE: "Menu",
+    **{getattr(e, f"KEY_F{i}"): f"F{i}" for i in range(1, 13)},
+}
+
+MODS = {
+    e.KEY_LEFTCTRL: "Ctrl", e.KEY_RIGHTCTRL: "Ctrl",
+    e.KEY_LEFTALT: "Alt", e.KEY_RIGHTALT: "AltGr",
+    e.KEY_LEFTSHIFT: "Shift", e.KEY_RIGHTSHIFT: "Shift",
+    e.KEY_LEFTMETA: "Super", e.KEY_RIGHTMETA: "Super",
+}
+MOD_ORDER = ["Ctrl", "Super", "Alt", "AltGr", "Shift"]
+
+
+# ---------------------------------------------------------------- input reader
+class KeyReader(threading.Thread):
+    def __init__(self, on_key):
+        super().__init__(daemon=True)
+        self.on_key = on_key
+        self.sel = selectors.DefaultSelector()
+        self.devices = {}
+        self.held = {}  # keycode -> mod name
+
+    def scan(self):
+        for path in evdev.list_devices():
+            if path in self.devices:
+                continue
+            try:
+                dev = evdev.InputDevice(path)
+                keys = dev.capabilities().get(e.EV_KEY, [])
+                if e.KEY_A in keys or e.KEY_ENTER in keys:   # looks like a keyboard
+                    self.devices[path] = dev
+                    self.sel.register(dev, selectors.EVENT_READ)
+                else:
+                    dev.close()
+            except (PermissionError, OSError):
+                pass
+
+    def run(self):
+        last_scan = 0
+        while True:
+            if time.time() - last_scan > 3:   # pick up hot-plugged keyboards
+                self.scan()
+                last_scan = time.time()
+            for key, _ in self.sel.select(timeout=1):
+                dev = key.fileobj
+                try:
+                    for ev in dev.read():
+                        if ev.type == e.EV_KEY:
+                            self.handle(ev.code, ev.value)
+                except OSError:  # unplugged
+                    self.sel.unregister(dev)
+                    self.devices.pop(dev.path, None)
+
+    def handle(self, code, value):
+        if code in MODS:
+            if value == 1:
+                self.held[code] = MODS[code]
+            elif value == 0:
+                self.held.pop(code, None)
+            return
+        if value == 0:  # release
+            return
+        mods = set(self.held.values())
+        shift = "Shift" in mods
+        combo_mods = [m for m in MOD_ORDER if m in mods and m != "Shift"]
+        if code in CHARS and not combo_mods:
+            # plain typing (shift just changes the char)
+            self.on_key(CHARS[code][1 if shift else 0], True)
+            return
+        name = SPECIAL.get(code)
+        if name is None:
+            if code in CHARS:
+                name = CHARS[code][0].upper()
+            else:
+                name = e.KEY.get(code, f"key{code}")
+                name = (name[0] if isinstance(name, list) else name).replace("KEY_", "").title()
+        if code == e.KEY_SPACE and not combo_mods and not shift:
+            self.on_key("␣", True)
+            return
+        if code in CHARS:
+            name = CHARS[code][0].upper()
+        parts = combo_mods + (["Shift"] if shift else []) + [name]
+        self.on_key("+".join(parts), False)
+
+
+# ---------------------------------------------------------------- overlay
+class Overlay(Gtk.Window):
+    def __init__(self, args):
+        super().__init__(type=Gtk.WindowType.POPUP)
+        self.args = args
+        self.items = []          # list of [text, is_typing]
+        self.last = 0
+        self.alpha = 0.0
+        self.set_app_paintable(True)
+        visual = self.get_screen().get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+        self.set_keep_above(True)
+        self.set_accept_focus(False)
+        self.connect("draw", self.on_draw)
+        self.connect("realize", lambda w: w.input_shape_combine_region(cairo.Region()))  # click-through
+        self.font = Pango.FontDescription(f"Sans Bold {args.size}")
+        GLib.timeout_add(50, self.tick)
+
+    def add(self, text, typing):
+        now = time.time()
+        if now - self.last > self.args.timeout:
+            self.items = []
+        if typing and self.items and self.items[-1][1]:
+            self.items[-1][0] += text
+        else:
+            self.items.append([text, typing])
+        self.last = now
+        self.alpha = 1.0
+        self.relayout()
+        return False
+
+    def label(self):
+        s = "  ".join(t for t, _ in self.items)
+        return s[-self.args.max_chars:]
+
+    def relayout(self):
+        layout = self.create_pango_layout(self.label() or " ")
+        layout.set_font_description(self.font)
+        tw, th = layout.get_pixel_size()
+        pad = int(self.args.size * 0.45)
+        w, h = tw + pad * 2, th + pad
+        self._layout, self._pad = layout, pad
+        mon = Gdk.Display.get_default().get_primary_monitor() or \
+            Gdk.Display.get_default().get_monitor(0)
+        g = mon.get_geometry()
+        pos, m = self.args.position, self.args.margin
+        if pos.endswith("right"):
+            x = g.x + g.width - w - m
+        elif pos.endswith("left"):
+            x = g.x + m
+        else:
+            x = g.x + (g.width - w) // 2
+        if pos.startswith("top"):
+            y = g.y + 60
+        elif pos == "center":
+            y = g.y + (g.height - h) // 2
+        else:
+            y = g.y + g.height - h - 100
+        self.resize(w, h)
+        self.move(x, y)
+        self.show_all()
+        self.queue_draw()
+
+    def tick(self):
+        if self.items and time.time() - self.last > self.args.timeout:
+            self.alpha -= 0.08
+            if self.alpha <= 0:
+                self.items = []
+                self.hide()
+            else:
+                self.queue_draw()
+        return True
+
+    def on_draw(self, w, cr):
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        W, H = self.get_size()
+        r = min(10, H / 2)
+        cr.new_sub_path()
+        cr.arc(W - r, r, r, -1.5708, 0)
+        cr.arc(W - r, H - r, r, 0, 1.5708)
+        cr.arc(r, H - r, r, 1.5708, 3.1416)
+        cr.arc(r, r, r, 3.1416, 4.7124)
+        cr.close_path()
+        cr.set_source_rgba(0.08, 0.08, 0.1, self.args.opacity * self.alpha)
+        cr.fill()
+        cr.set_source_rgba(1, 1, 1, self.alpha)
+        cr.move_to(self._pad, self._pad / 2)
+        PangoCairo.show_layout(cr, self._layout)
+        return True
+
+
+def main():
+    p = argparse.ArgumentParser(description="Show keystrokes on screen (Wayland-friendly).")
+    p.add_argument("--position", default="bottom-right",
+                   choices=["bottom", "bottom-right", "bottom-left",
+                            "top", "top-right", "top-left", "center"])
+    p.add_argument("--margin", type=int, default=40, help="gap from screen edge for left/right")
+    p.add_argument("--size", type=int, default=16, help="font size (default 16)")
+    p.add_argument("--timeout", type=float, default=2.5, help="seconds before fading")
+    p.add_argument("--opacity", type=float, default=0.8, help="background opacity 0-1")
+    p.add_argument("--max-chars", type=int, default=20)
+    args = p.parse_args()
+
+    overlay = Overlay(args)
+    reader = KeyReader(lambda t, typing: GLib.idle_add(overlay.add, t, typing))
+    reader.scan()
+    if not reader.devices:
+        sys.exit("No readable keyboard found in /dev/input.\n"
+                 "Add yourself to the input group:  sudo usermod -aG input $USER\n"
+                 "then log out and log back in.")
+    print(f"keyscreen running ({len(reader.devices)} keyboard device(s)). Ctrl+C to quit.")
+    reader.start()
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 2, Gtk.main_quit)  # SIGINT
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

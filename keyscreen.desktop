@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Keyscreen
+Comment=Show pressed keys on screen (open again to stop)
+Exec=keyscreen-toggle
+Icon=input-keyboard
+Terminal=false
+Categories=Utility;

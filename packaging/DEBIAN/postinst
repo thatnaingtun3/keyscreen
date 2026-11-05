@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+# keyscreen reads the keyboard from /dev/input, which needs the 'input' group.
+U="${SUDO_USER:-}"
+[ -z "$U" ] && [ -n "${PKEXEC_UID:-}" ] && U="$(getent passwd "$PKEXEC_UID" | cut -d: -f1)"
+if [ -n "$U" ] && [ "$U" != root ] && ! id -nG "$U" | grep -qw input; then
+    usermod -aG input "$U"
+    echo "Added $U to the 'input' group. Log out and log back in, then open Keyscreen."
+fi
+update-desktop-database -q /usr/share/applications 2>/dev/null || true

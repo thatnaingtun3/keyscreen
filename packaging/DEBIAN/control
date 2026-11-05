@@ -1,0 +1,11 @@
+Package: keyscreen
+Version: 1.0
+Section: utils
+Priority: optional
+Architecture: all
+Depends: python3, python3-evdev, python3-gi, python3-gi-cairo, python3-cairo, gir1.2-gtk-3.0
+Maintainer: Liberty Global Education <info@libertyglobaleducation.com>
+Description: Show pressed keys on screen (works on Wayland)
+ Small overlay that displays your keystrokes in a corner of the screen,
+ useful for screen recording and tutorials. Open it from the app menu;
+ open it again to stop it.

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Start keyscreen, or stop it if it is already running.
+pkill -f 'bin/keyscreen( |$)' || exec keyscreen >/dev/null 2>&1

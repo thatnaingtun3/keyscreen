@@ -4,13 +4,18 @@
 Reads keystrokes directly from /dev/input (needs membership in the 'input' group)
 and draws them in a transparent, click-through, always-on-top overlay.
 
-Usage: keyscreen [--position bottom-right|bottom-left|bottom|top-right|top-left|top|center] [--margin 40] [--size 16] [--timeout 2.5] [--opacity 0.8]
+Usage: keyscreen [--position bottom-right|bottom-left|bottom|top-right|top-left|top|center] [--margin 40] [--size 16] [--timeout 2.5] [--opacity 0.8] [--layout de]
 Stop:  Ctrl+C in the terminal, or `pkill -f keyscreen`
 """
 import argparse
+import ctypes
+import ctypes.util
 import os
 import selectors
+import signal
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -68,11 +73,125 @@ MODS = {
 MOD_ORDER = ["Ctrl", "Super", "Alt", "AltGr", "Shift"]
 
 
+# ---------------------------------------------------------------- layouts
+# Keys whose own press steers the XKB text state: Shift and Caps Lock change
+# characters, AltGr selects the third/fourth level.  Ctrl/Super/Alt are combos,
+# not text, so they never reach the state (with Ctrl down, "c" would come back
+# as "\x03").
+SHIFT_KEYS = {e.KEY_LEFTSHIFT, e.KEY_RIGHTSHIFT}
+TEXT_MODIFIERS = SHIFT_KEYS | {e.KEY_RIGHTALT, e.KEY_CAPSLOCK}
+XKB_KEYCODE_OFFSET = 8      # evdev keycodes are XKB/X11 keycodes minus 8
+XKB_KEY_UP, XKB_KEY_DOWN = 0, 1
+
+
+class XkbRuleNames(ctypes.Structure):
+    """struct xkb_rule_names from <xkbcommon/xkbcommon.h>."""
+    _fields_ = [(field, ctypes.c_char_p) for field in
+                ("rules", "model", "layout", "variant", "options")]
+
+
+def active_layout_names():
+    """(layout, variant) of the running X11/XWayland keymap, if we can ask."""
+    try:
+        out = subprocess.run(["setxkbmap", "-query"], capture_output=True,
+                             text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    found = {}
+    for line in out.splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() in ("layout", "variant"):
+            found[key.strip()] = value.strip() or None
+    return found.get("layout"), found.get("variant")
+
+
+class Layout:
+    """Turns evdev keycodes into text using the user's real keyboard layout.
+
+    Talks to libxkbcommon through ctypes, so no python binding is needed.  Two
+    states are kept: one with Shift applied for the text actually typed, and one
+    without it for naming keys in combos (Ctrl+Shift+S, not Ctrl+Shift+s).
+    """
+
+    def __init__(self, layout=None, variant=None):
+        self._lib = self._keymap = self._state = self._base = None
+        self._load(layout, variant)
+
+    @property
+    def ok(self):
+        return bool(self._state and self._base)
+
+    def _load(self, layout, variant):
+        path = ctypes.util.find_library("xkbcommon")
+        if not path:
+            return
+        try:
+            lib = ctypes.CDLL(path)
+        except OSError:
+            return
+        lib.xkb_context_new.restype = ctypes.c_void_p
+        lib.xkb_context_new.argtypes = [ctypes.c_int]
+        lib.xkb_keymap_new_from_names.restype = ctypes.c_void_p
+        lib.xkb_keymap_new_from_names.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(XkbRuleNames), ctypes.c_int]
+        lib.xkb_state_new.restype = ctypes.c_void_p
+        lib.xkb_state_new.argtypes = [ctypes.c_void_p]
+        lib.xkb_state_update_key.restype = ctypes.c_int
+        lib.xkb_state_update_key.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                             ctypes.c_int]
+        lib.xkb_state_key_get_utf8.restype = ctypes.c_int
+        lib.xkb_state_key_get_utf8.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                               ctypes.c_char_p, ctypes.c_size_t]
+        ctx = lib.xkb_context_new(0)    # XKB_CONTEXT_NO_FLAGS
+        if not ctx:
+            return
+        names = XkbRuleNames(None, None,
+                             layout.encode() if layout else None,
+                             variant.encode() if variant else None, None)
+        keymap = lib.xkb_keymap_new_from_names(ctx, ctypes.byref(names), 0)
+        if not keymap:      # unknown --layout name: keep the fallback table
+            return
+        self._lib, self._keymap = lib, keymap
+        self._state = lib.xkb_state_new(keymap)
+        self._base = lib.xkb_state_new(keymap)
+
+    def _utf8(self, state, code):
+        buf = ctypes.create_string_buffer(64)
+        keycode = code + XKB_KEYCODE_OFFSET
+        if self._lib.xkb_state_key_get_utf8(state, keycode, buf, len(buf)):
+            return buf.value.decode("utf-8", "replace")
+        return ""
+
+    def update(self, code, down):
+        """Feed a Shift/AltGr/Caps Lock press or release into the states."""
+        if not self.ok or code not in TEXT_MODIFIERS:
+            return
+        keycode = code + XKB_KEYCODE_OFFSET
+        state = XKB_KEY_DOWN if down else XKB_KEY_UP
+        self._lib.xkb_state_update_key(self._state, keycode, state)
+        if code not in SHIFT_KEYS:      # the naming state ignores Shift
+            self._lib.xkb_state_update_key(self._base, keycode, state)
+
+    def text(self, code):
+        """What this key types right now ('' for e.g. arrows)."""
+        return self._utf8(self._state, code) if self.ok else ""
+
+    def base(self, code):
+        """What this key types with Shift released."""
+        return self._utf8(self._base, code) if self.ok else ""
+
+
+def printable_text(text):
+    """True for text worth showing as characters (not CR, Tab, NUL...)."""
+    return bool(text) and text.isprintable() and not text.isspace()
+
+
 # ---------------------------------------------------------------- input reader
 class KeyReader(threading.Thread):
-    def __init__(self, on_key):
+    def __init__(self, on_key, layout=None):
         super().__init__(daemon=True)
         self.on_key = on_key
+        self.layout = layout
         self.sel = selectors.DefaultSelector()
         self.devices = {}
         self.held = {}  # keycode -> mod name
@@ -108,35 +227,52 @@ class KeyReader(threading.Thread):
                     self.sel.unregister(dev)
                     self.devices.pop(dev.path, None)
 
+    def char(self, code):
+        """The text this key types, or '' for keys that type nothing."""
+        if code == e.KEY_SPACE:
+            return "␣"      # a bare space would be invisible in the overlay
+        text = self.layout.text(code) if self.layout else ""
+        if printable_text(text):
+            return text
+        if code in CHARS:   # keypad digits, or no XKB data on this system
+            return CHARS[code][1 if "Shift" in self.held.values() else 0]
+        return ""
+
+    def key_name(self, code):
+        """Display name of a key inside a combo (Ctrl+C, Alt+Tab...)."""
+        if code == e.KEY_SPACE:
+            return "␣"
+        text = self.layout.base(code) if self.layout else ""
+        if printable_text(text) and len(text) == 1:
+            return text.upper()
+        if not printable_text(text) and code in CHARS:
+            return CHARS[code][0].upper()
+        name = SPECIAL.get(code)
+        if name:
+            return name
+        name = e.KEY.get(code, f"key{code}")
+        name = name[0] if isinstance(name, list) else name
+        return name.replace("KEY_", "").title()
+
     def handle(self, code, value):
+        if self.layout and code in TEXT_MODIFIERS:
+            self.layout.update(code, value != 0)
         if code in MODS:
             if value == 1:
                 self.held[code] = MODS[code]
             elif value == 0:
                 self.held.pop(code, None)
             return
-        if value == 0:  # release
+        if value != 1:      # release (0), or autorepeat (2) from a held key
             return
         mods = set(self.held.values())
         shift = "Shift" in mods
         combo_mods = [m for m in MOD_ORDER if m in mods and m != "Shift"]
-        if code in CHARS and not combo_mods:
-            # plain typing (shift just changes the char)
-            self.on_key(CHARS[code][1 if shift else 0], True)
+        text = self.char(code)
+        if text and not combo_mods:
+            self.on_key(text, True)     # plain typing (shift just changes the char)
             return
-        name = SPECIAL.get(code)
-        if name is None:
-            if code in CHARS:
-                name = CHARS[code][0].upper()
-            else:
-                name = e.KEY.get(code, f"key{code}")
-                name = (name[0] if isinstance(name, list) else name).replace("KEY_", "").title()
-        if code == e.KEY_SPACE and not combo_mods and not shift:
-            self.on_key("␣", True)
-            return
-        if code in CHARS:
-            name = CHARS[code][0].upper()
-        parts = combo_mods + (["Shift"] if shift else []) + [name]
+        parts = combo_mods + (["Shift"] if shift else []) + [self.key_name(code)]
         self.on_key("+".join(parts), False)
 
 
@@ -236,28 +372,74 @@ class Overlay(Gtk.Window):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Show keystrokes on screen (Wayland-friendly).")
-    p.add_argument("--position", default="bottom-right",
+    p = argparse.ArgumentParser(
+        prog="keyscreen",
+        description="Show keystrokes on screen (Wayland-friendly).",
+        epilog="examples:\n"
+               "  keyscreen                                    auto-detect the layout\n"
+               "  keyscreen --position top-left --size 20\n"
+               "  keyscreen --layout fr --variant nodeadkeys\n"
+               "  keyscreen --timeout 1.5 --opacity 0.6\n"
+               "\n"
+               "Your user must be in the 'input' group to read /dev/input; the .deb\n"
+               "installer adds it (log out and back in for it to take effect).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--position", default="bottom-right", metavar="POS",
                    choices=["bottom", "bottom-right", "bottom-left",
-                            "top", "top-right", "top-left", "center"])
-    p.add_argument("--margin", type=int, default=40, help="gap from screen edge for left/right")
-    p.add_argument("--size", type=int, default=16, help="font size (default 16)")
-    p.add_argument("--timeout", type=float, default=2.5, help="seconds before fading")
-    p.add_argument("--opacity", type=float, default=0.8, help="background opacity 0-1")
-    p.add_argument("--max-chars", type=int, default=20)
+                            "top", "top-right", "top-left", "center"],
+                   help="where the overlay sits: top-left, top, top-right, "
+                        "center, bottom-left, bottom, bottom-right "
+                        "(default: bottom-right)")
+    p.add_argument("--margin", type=int, default=40, metavar="PX",
+                   help="gap from the screen edge, for left/right positions (default: 40)")
+    p.add_argument("--size", type=int, default=16, metavar="PT",
+                   help="font size (default: 16)")
+    p.add_argument("--timeout", type=float, default=2.5, metavar="SEC",
+                   help="seconds before it fades (default: 2.5)")
+    p.add_argument("--opacity", type=float, default=0.8, metavar="0-1",
+                   help="background opacity (default: 0.8)")
+    p.add_argument("--max-chars", type=int, default=20, metavar="N",
+                   help="keep only the last N characters of history (default: 20)")
+    p.add_argument("--layout", metavar="NAME",
+                   help="keyboard layout for key names, e.g. de or fr "
+                        "(default: auto-detect)")
+    p.add_argument("--variant", metavar="NAME",
+                   help="layout variant, e.g. nodeadkeys (default: none)")
     args = p.parse_args()
 
+    layout, variant = args.layout, args.variant
+    if not layout:
+        layout, variant = active_layout_names()
+    keyboard = Layout(layout, variant)
+    if not keyboard.ok:
+        print("Note: no usable XKB layout found, falling back to a US key map.",
+              file=sys.stderr)
+
     overlay = Overlay(args)
-    reader = KeyReader(lambda t, typing: GLib.idle_add(overlay.add, t, typing))
+    reader = KeyReader(lambda t, typing: GLib.idle_add(overlay.add, t, typing),
+                       keyboard)
     reader.scan()
     if not reader.devices:
         sys.exit("No readable keyboard found in /dev/input.\n"
                  "Add yourself to the input group:  sudo usermod -aG input $USER\n"
                  "then log out and log back in.")
     print(f"keyscreen running ({len(reader.devices)} keyboard device(s)). Ctrl+C to quit.")
-    reader.start()
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 2, Gtk.main_quit)  # SIGINT
-    Gtk.main()
+    # proves to keyscreen-toggle which process to stop, wherever it was started from
+    pidfile = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(),
+                           "keyscreen.pid")
+    try:
+        with open(pidfile, "w") as fh:
+            fh.write(f"{os.getpid()}\n")
+        reader.start()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, Gtk.main_quit)
+        Gtk.main()
+    finally:
+        try:
+            os.unlink(pidfile)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

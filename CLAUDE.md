@@ -11,7 +11,8 @@ Keyscreen is a single-file Python 3 / GTK3 app that shows pressed keys in a tran
 ```sh
 ./keyscreen                                   # run from source (Ctrl+C to quit)
 ./keyscreen --position top-left --size 20     # try options; see main() for the full list
-python3 -m py_compile keyscreen               # syntax check (there is no test suite or linter)
+python3 -m py_compile keyscreen               # syntax check
+python3 -m unittest -v                        # key-handling and layout tests
 ./build-deb.sh                                # builds dist/keyscreen_<version>_all.deb
 sudo apt install ./dist/keyscreen_*_all.deb   # install the build locally
 ```
@@ -24,6 +25,8 @@ All runtime logic is in `keyscreen` (an extensionless Python script):
 
 - **Why it works on Wayland.** Wayland won't let an app read global keystrokes, so `KeyReader` reads `/dev/input` directly through `python3-evdev`. It runs in a daemon thread, selects on every device that looks like a keyboard, and rescans every 3 s to pick up hot-plugged keyboards. The overlay window forces `GDK_BACKEND=x11` (XWayland) so it can be positioned and kept on top. This must stay set before GTK is imported.
 - **Thread boundary.** `KeyReader` turns raw key codes into display strings (`CHARS` / `SPECIAL` / `MODS` tables, with modifiers ordered by `MOD_ORDER`). It hands them to the GTK main loop via `GLib.idle_add(overlay.add, ...)`. Never touch GTK objects from the reader thread.
+- **Layouts.** `Layout` translates keycodes into text with libxkbcommon (via `ctypes`, no binding needed), so AZERTY/QWERTZ and AltGr work. It is fed only Shift/AltGr/Caps Lock (`TEXT_MODIFIERS`) — Ctrl/Super/Alt stay out of the XKB state, which is what keeps `Ctrl+C` a combo instead of `\x03`. `CHARS` is the fallback when XKB data is unavailable; evdev codes are XKB keycodes minus 8. Tests in `test_keyscreen.py` import this extensionless script through `SourceFileLoader`.
+- **Single instance.** `main()` writes `$XDG_RUNTIME_DIR/keyscreen.pid` so `keyscreen-toggle` can stop the right process, including a run from source.
 - **Overlay.** `Overlay` is a `Gtk.Window` of type POPUP with an empty input shape, which makes it click-through. Plain typing is merged into the last item. Combos (for example `Ctrl+C`) become separate items. `relayout()` resizes the window to fit the text and positions it from `--position` / `--margin` on the primary monitor. `tick()` (every 50 ms) fades it out after `--timeout`. `on_draw` paints the rounded background with cairo.
 
 Packaging is separate from the code:

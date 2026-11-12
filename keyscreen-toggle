@@ -1,3 +1,21 @@
 #!/bin/sh
 # Start keyscreen, or stop it if it is already running.
-pkill -f 'bin/keyscreen( |$)' || exec keyscreen >/dev/null 2>&1
+PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/keyscreen.pid"
+
+if [ -r "$PIDFILE" ]; then
+    PID=$(cat "$PIDFILE" 2>/dev/null)
+    # Only trust the pid if that process really is keyscreen (pids get reused).
+    # Matches an argv entry that ends in "keyscreen", so a stale pid that now
+    # belongs to, say, `vim keyscreen.pid` is not killed.
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null &&
+       tr '\0' '\n' < "/proc/$PID/cmdline" 2>/dev/null | grep -qxE '(.*/)?keyscreen'; then
+        kill "$PID" && rm -f "$PIDFILE"
+        exit 0
+    fi
+    rm -f "$PIDFILE"    # stale
+fi
+
+# Instances started before the pidfile existed (installed copies only).
+pkill -f 'bin/keyscreen( |$)' && exit 0
+
+exec keyscreen >/dev/null 2>&1

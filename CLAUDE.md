@@ -38,7 +38,7 @@ Packaging is separate from the code:
 ## Releasing
 
 1. Bump `Version:` in `packaging/DEBIAN/control`.
-2. Run `./build-deb.sh`, then commit and push.
-3. Run `gh release create v<version> dist/keyscreen_<version>_all.deb`.
+2. Commit and push.
+3. Tag and push the tag: `git tag v<version> && git push origin v<version>`. `.github/workflows/release.yml` builds the `.deb` and attaches it to the release, and fails if the tag does not match the version in `control`.
 
 `dist/` and `*.deb` are gitignored. The `.deb` is distributed only through GitHub Releases.

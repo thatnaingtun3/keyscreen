@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the packaged version
+        run: |
+          version=$(sed -n 's/^Version: //p' packaging/DEBIAN/control)
+          if [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Version: $version in packaging/DEBIAN/control"
+            exit 1
+          fi
+
+      - name: Build .deb
+        run: ./build-deb.sh
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
+          fail_on_unmatched_files: true
+          generate_release_notes: true

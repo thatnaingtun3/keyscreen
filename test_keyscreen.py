@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Tests for keyscreen's key handling.  Run:  python3 -m unittest -v"""
+import importlib
 import importlib.machinery
 import importlib.util
 import os
@@ -8,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import unittest.mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOGGLE = os.path.join(HERE, "keyscreen-toggle")
@@ -343,6 +345,18 @@ class ToggleTests(unittest.TestCase):
         proc, pid = self.start_in_background(not_pid=decoy.pid)
         self.assertNotEqual(pid, decoy.pid)
         self.assertTrue(alive(decoy.pid), "toggle killed an unrelated process")
+
+
+class CairoDependencyTests(unittest.TestCase):
+    def test_missing_gi_cairo_gives_an_install_hint(self):
+        """The cairo converters ship in python3-gi-cairo; without them GTK's
+        callbacks die with a bare KeyError, so startup must name the package."""
+        gi = importlib.import_module("gi")
+        missing = ImportError("No module named 'gi._gi_cairo'")
+        with unittest.mock.patch.object(gi, "require_foreign", side_effect=missing):
+            with self.assertRaises(SystemExit) as caught:
+                ks.require_cairo()
+        self.assertIn("python3-gi-cairo", str(caught.exception.code))
 
 
 if __name__ == "__main__":

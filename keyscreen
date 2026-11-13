@@ -33,6 +33,18 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("Pango", "1.0")
 gi.require_version("PangoCairo", "1.0")
+
+
+def require_cairo():
+    """Gtk hands cairo.Context and cairo.Region to our callbacks, so the cairo
+    foreign struct converters must be registered before any window is created.
+    Without them every draw and click-through call fails with a bare KeyError."""
+    try:
+        gi.require_foreign("cairo")
+    except ImportError:
+        sys.exit("python3-gi-cairo missing. Install with:  sudo apt install python3-gi-cairo")
+
+
 from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo
 
 # ---------------------------------------------------------------- key names
@@ -407,6 +419,7 @@ def main():
     p.add_argument("--variant", metavar="NAME",
                    help="layout variant, e.g. nodeadkeys (default: none)")
     args = p.parse_args()
+    require_cairo()  # --help works without it; drawing and click-through do not
 
     layout, variant = args.layout, args.variant
     if not layout:
